@@ -8,6 +8,9 @@
  */
 package org.openhab.binding.zigbee.internal;
 
+import static java.util.Collections.emptyList;
+import static java.util.stream.Collectors.toSet;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
@@ -17,10 +20,12 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Date;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 
 import org.eclipse.smarthome.config.core.ConfigConstants;
 import org.openhab.binding.zigbee.ZigBeeBindingConstants;
@@ -32,12 +37,12 @@ import com.thoughtworks.xstream.io.xml.PrettyPrintWriter;
 import com.thoughtworks.xstream.io.xml.StaxDriver;
 import com.zsmartsystems.zigbee.IeeeAddress;
 import com.zsmartsystems.zigbee.ZigBeeNetworkManager;
-import com.zsmartsystems.zigbee.ZigBeeNetworkStateSerializer;
 import com.zsmartsystems.zigbee.ZigBeeNode;
-import com.zsmartsystems.zigbee.dao.ZclClusterDao;
-import com.zsmartsystems.zigbee.dao.ZigBeeEndpointDao;
-import com.zsmartsystems.zigbee.dao.ZigBeeNodeDao;
-import com.zsmartsystems.zigbee.zcl.ZclAttribute;
+import com.zsmartsystems.zigbee.database.ZclAttributeDao;
+import com.zsmartsystems.zigbee.database.ZclClusterDao;
+import com.zsmartsystems.zigbee.database.ZigBeeEndpointDao;
+import com.zsmartsystems.zigbee.database.ZigBeeNetworkDataStore;
+import com.zsmartsystems.zigbee.database.ZigBeeNodeDao;
 import com.zsmartsystems.zigbee.zdo.field.BindingTable;
 import com.zsmartsystems.zigbee.zdo.field.NodeDescriptor.FrequencyBandType;
 import com.zsmartsystems.zigbee.zdo.field.NodeDescriptor.MacCapabilitiesType;
@@ -49,7 +54,7 @@ import com.zsmartsystems.zigbee.zdo.field.PowerDescriptor.PowerSourceType;
  *
  * @author Chris Jackson
  * @author Pedro Garcia - Atomic (mostly) file operations
- * 
+ *
  *         Serialization of the network state to a file is done in the most atomic way portability allows for:
  *         - Serialization is done to a temporary file so that the network state file, if present, is always a complete,
  *         backupable, working version
@@ -65,7 +70,7 @@ import com.zsmartsystems.zigbee.zdo.field.PowerDescriptor.PowerSourceType;
  *
  */
 
-public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSerializer {
+public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkDataStore {
     /**
      * The logger.
      */
@@ -86,12 +91,15 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
      */
     private final String networkStateFilePath;
 
+    private final ZigBeeNetworkManager zigBeeNetworkManager;
+
     private final Object concurrentWriteCountSync = new Object();
     private int concurrentWriteCount = 0;
 
-    public ZigBeeNetworkStateSerializerImpl(String networkId) {
+    public ZigBeeNetworkStateSerializerImpl(String networkId, ZigBeeNetworkManager zigBeeNetworkManager) {
         this.networkId = networkId;
         networkStateFilePath = ConfigConstants.getUserDataFolder() + "/" + ZigBeeBindingConstants.BINDING_ID;
+        this.zigBeeNetworkManager = zigBeeNetworkManager;
     }
 
     private XStream openStream() {
@@ -111,7 +119,7 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
         stream.alias("ZigBeeNode", ZigBeeNodeDao.class);
         stream.alias("ZigBeeEndpoint", ZigBeeEndpointDao.class);
         stream.alias("ZclCluster", ZclClusterDao.class);
-        stream.alias("ZclAttribute", ZclAttribute.class);
+        stream.alias("ZclAttribute", ZclAttributeDao.class);
         stream.alias("MacCapabilitiesType", MacCapabilitiesType.class);
         stream.alias("ServerCapabilitiesType", ServerCapabilitiesType.class);
         stream.alias("PowerSourceType", PowerSourceType.class);
@@ -128,14 +136,14 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
      *
      * @param networkManager the network state
      */
-    private synchronized void doSerialize(final ZigBeeNetworkManager networkManager) {
+    private synchronized void doSerialize(Iterable<ZigBeeNode> nodes) {
         XStream stream = openStream();
 
         logger.debug("Saving ZigBee network state: Start.");
 
         final List<Object> destinations = new ArrayList<Object>();
 
-        for (ZigBeeNode node : networkManager.getNodes()) {
+        for (ZigBeeNode node : nodes) {
             ZigBeeNodeDao nodeDao = node.getDao();
             destinations.add(nodeDao);
         }
@@ -182,8 +190,7 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
      * @param networkManager the network state
      */
 
-    @Override
-    public void serialize(final ZigBeeNetworkManager networkManager) {
+    public void serialize(Iterable<ZigBeeNode> nodes) {
 
         boolean wait = false;
 
@@ -203,8 +210,9 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
                 logger.debug("Deferring ZigBee network state file save (another thread already writing)");
                 synchronized (concurrentWriteCountSync) {
                     // Check again, as the writing thread might already have finished when we get here
-                    if (concurrentWriteCount > 1)
+                    if (concurrentWriteCount > 1) {
                         concurrentWriteCountSync.wait();
+                    }
                 }
                 logger.debug("Resuming ZigBee network state file save (previous thread finished)");
             }
@@ -215,7 +223,7 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
         }
 
         try {
-            doSerialize(networkManager);
+            doSerialize(nodes);
         } catch (Exception e) {
             logger.debug("Error writing the network state file", e);
         }
@@ -231,8 +239,7 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
      *
      * @param networkState the network state
      */
-    @Override
-    public void deserialize(final ZigBeeNetworkManager networkState) {
+    public List<ZigBeeNodeDao> deserialize() {
         logger.debug("Loading ZigBee network state: Start.");
 
         final File file = getNetworkStateFile();
@@ -242,15 +249,17 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
             final File temp = new File(file.getAbsolutePath() + ".new");
             if (!temp.exists()) {
                 logger.debug("Loading ZigBee network state: File does not exist");
-                return;
+                return emptyList();
             }
 
             logger.warn("Recovering network state file from temporary copy");
             if (!temp.renameTo(file)) {
                 logger.warn("Error recovering network state file");
-                return;
+                return emptyList();
             }
         }
+
+        List<ZigBeeNodeDao> result = new ArrayList<ZigBeeNodeDao>();
 
         try {
             XStream stream = openStream();
@@ -260,21 +269,7 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
             for (final Object object : objects) {
                 if (object instanceof ZigBeeNodeDao) {
                     ZigBeeNodeDao nodeDao = (ZigBeeNodeDao) object;
-                    if (nodeDao.getNetworkAddress() == 0) {
-                        ZigBeeNode node = new ZigBeeNode(networkState, new IeeeAddress(nodeDao.getIeeeAddress()));
-                        node.setDao(nodeDao);
-                        networkState.addNode(node);
-                    }
-                }
-            }
-            for (final Object object : objects) {
-                if (object instanceof ZigBeeNodeDao) {
-                    ZigBeeNodeDao nodeDao = (ZigBeeNodeDao) object;
-                    if (nodeDao.getNetworkAddress() != 0) {
-                        ZigBeeNode node = new ZigBeeNode(networkState, new IeeeAddress(nodeDao.getIeeeAddress()));
-                        node.setDao(nodeDao);
-                        networkState.addNode(node);
-                    }
+                    result.add(nodeDao);
                 }
             }
         } catch (Exception e) {
@@ -282,6 +277,8 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
         }
 
         logger.debug("Loading ZigBee network state: Done.");
+
+        return result;
     }
 
     /**
@@ -299,6 +296,27 @@ public class ZigBeeNetworkStateSerializerImpl implements ZigBeeNetworkStateSeria
 
     private File getNetworkStateFile() {
         return new File(networkStateFilePath + "/" + networkStateFileName + networkId + ".xml");
+    }
+
+    @Override
+    public Set<IeeeAddress> readNetworkNodes() {
+        return deserialize().stream().map(node -> node.getIeeeAddress()).collect(toSet());
+    }
+
+    @Override
+    public ZigBeeNodeDao readNode(IeeeAddress address) {
+        return deserialize().stream().filter(node -> Objects.equals(address, node.getIeeeAddress())).findFirst()
+                .orElse(null);
+    }
+
+    @Override
+    public void writeNode(ZigBeeNodeDao node) {
+        serialize(zigBeeNetworkManager.getNodes());
+    }
+
+    @Override
+    public void removeNode(IeeeAddress address) {
+        serialize(zigBeeNetworkManager.getNodes());
     }
 
 }
